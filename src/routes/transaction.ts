@@ -3,30 +3,59 @@ import { zValidator } from '@hono/zod-validator'
 import { z } from 'zod'
 import { db } from '../db'
 import { transactions, wallets, categories } from '../db/schema' 
-import { eq, desc, and} from 'drizzle-orm'
+import { eq, desc, and } from 'drizzle-orm'
 
+// --- Types ---
 type Variables = {
   jwtPayload: {
-    sub: number
+    // Note: If 'sub' is a string in your JWT, the 'userId' must be cast to a number.
+    sub: string | number 
     username: string
   }
 }
 
 const transactionRouter = new Hono<{ Variables: Variables }>()
 
-// Validation Schema for IDR
+// --- Validation Schema ---
 const transactionSchema = z.object({
   amount: z.number().int().positive(), 
   type: z.enum(['income', 'expense', 'transfer']),
-  categoryId: z.number().int(), // Requires the ID, not the string name
+  categoryId: z.number().int(),
   description: z.string().optional(),
   walletId: z.number().int(), 
   toWalletId: z.number().int().optional(),
+  // Date validation can be complex; using string here as in original code
   date: z.string().optional(),
 })
 
+// --- Helper for User ID ---
+// Ensures userId is always a number for Drizzle queries
+const getUserId = (c: { get: (key: 'jwtPayload') => Variables['jwtPayload'] }) => {
+    return Number(c.get('jwtPayload').sub);
+};
+
+
+transactionRouter.get('/total', async (c) => {
+  const userId = getUserId(c) 
+  
+  if (isNaN(userId) || userId === 0) {
+    return c.json({ error: "Unauthorized or missing user context." }, 401)
+  }
+
+  const allTransactions = await db.select()
+    .from(transactions)
+    .where(eq(transactions.userId, userId))
+
+  const total = allTransactions.reduce((acc, curr) => {
+    return curr.type === 'income' ? acc + curr.amount : acc - curr.amount
+  }, 0)
+
+  return c.json({ balance: total })
+})
+
+// 1. GET /transactions (List All)
 transactionRouter.get('/', async (c) => {
-  const userId = c.get('jwtPayload').sub
+  const userId = getUserId(c)
 
   const result = await db.select({
     id: transactions.id,
@@ -51,10 +80,17 @@ transactionRouter.get('/', async (c) => {
   return c.json(result)
 })
 
-// 1.1 GET /transactions/:id (Transaction Detail)
+// ---
+
+// 1.1 GET /transactions/:id (Transaction Detail) - FIX APPLIED
 transactionRouter.get('/:id', async (c) => {
-    const userId = c.get('jwtPayload').sub
+    const userId = getUserId(c)
     const id = Number(c.req.param('id'))
+
+    // ⭐️ FIX: Validate ID to prevent DrizzleQueryError (NaN issue)
+    if (isNaN(id) || id === 0) {
+        return c.json({ error: "Invalid transaction ID format." }, 400)
+    }
 
     // Perform a detailed join to get all linked data
     const result = await db.select({
@@ -76,11 +112,11 @@ transactionRouter.get('/:id', async (c) => {
       .from(transactions)
       .where(and(
           eq(transactions.id, id),
-          eq(transactions.userId, userId) // Crucial: Only load if owned by user
+          eq(transactions.userId, userId)
       ))
       .leftJoin(wallets, eq(transactions.walletId, wallets.id)) 
       .leftJoin(categories, eq(transactions.categoryId, categories.id)) 
-      .get() // Use .get() to return a single object
+      .get() 
 
     if (!result) {
         return c.json({ error: "Transaction not found." }, 404)
@@ -89,9 +125,11 @@ transactionRouter.get('/:id', async (c) => {
     return c.json(result)
 })
 
+// ---
+
 // 2. POST /transactions (Add new IDR transaction)
 transactionRouter.post('/', zValidator('json', transactionSchema), async (c) => {
-  const userId = c.get('jwtPayload').sub
+  const userId = getUserId(c)
   const body = c.req.valid('json')
 
   // --- WALLET CHECK ---
@@ -121,7 +159,7 @@ transactionRouter.post('/', zValidator('json', transactionSchema), async (c) => 
     userId: userId,
     amount: body.amount,
     type: body.type,
-    categoryId: body.categoryId, // Using categoryId
+    categoryId: body.categoryId,
     description: body.description,
     walletId: body.walletId, 
     toWalletId: body.toWalletId,
@@ -131,10 +169,14 @@ transactionRouter.post('/', zValidator('json', transactionSchema), async (c) => 
   return c.json(result[0], 201)
 })
 
-// 3. DELETE /transactions/:id
+
 transactionRouter.delete('/:id', async (c) => {
-  const userId = c.get('jwtPayload').sub
+  const userId = getUserId(c)
   const id = Number(c.req.param('id'))
+
+  if (isNaN(id) || id === 0) {
+    return c.json({ error: "Invalid transaction ID format." }, 400)
+  }
 
   const deleted = await db.delete(transactions)
     .where(eq(transactions.id, id))
@@ -147,19 +189,7 @@ transactionRouter.delete('/:id', async (c) => {
   return c.json({ message: "Deleted successfully" })
 })
 
-// 4. GET /transactions/total (IDR Balance)
-transactionRouter.get('/total', async (c) => {
-  const userId = c.get('jwtPayload').sub
 
-  const allTransactions = await db.select()
-    .from(transactions)
-    .where(eq(transactions.userId, userId))
 
-  const total = allTransactions.reduce((acc, curr) => {
-    return curr.type === 'income' ? acc + curr.amount : acc - curr.amount
-  }, 0)
-
-  return c.json({ balance: total })
-})
 
 export default transactionRouter
