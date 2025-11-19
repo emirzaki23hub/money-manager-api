@@ -5,10 +5,8 @@ import { db } from '../db'
 import { transactions, wallets, categories } from '../db/schema' 
 import { eq, desc, and } from 'drizzle-orm'
 
-// --- Types ---
 type Variables = {
   jwtPayload: {
-    // Note: If 'sub' is a string in your JWT, the 'userId' must be cast to a number.
     sub: string | number 
     username: string
   }
@@ -16,7 +14,6 @@ type Variables = {
 
 const transactionRouter = new Hono<{ Variables: Variables }>()
 
-// --- Validation Schema ---
 const transactionSchema = z.object({
   amount: z.number().int().positive(), 
   type: z.enum(['income', 'expense', 'transfer']),
@@ -24,12 +21,9 @@ const transactionSchema = z.object({
   description: z.string().optional(),
   walletId: z.number().int(), 
   toWalletId: z.number().int().optional(),
-  // Date validation can be complex; using string here as in original code
   date: z.string().optional(),
 })
 
-// --- Helper for User ID ---
-// Ensures userId is always a number for Drizzle queries
 const getUserId = (c: { get: (key: 'jwtPayload') => Variables['jwtPayload'] }) => {
     return Number(c.get('jwtPayload').sub);
 };
@@ -80,19 +74,15 @@ transactionRouter.get('/', async (c) => {
   return c.json(result)
 })
 
-// ---
-
-// 1.1 GET /transactions/:id (Transaction Detail) - FIX APPLIED
+// 1.1 GET /transactions/:id (Transaction Detail)
 transactionRouter.get('/:id', async (c) => {
     const userId = getUserId(c)
     const id = Number(c.req.param('id'))
 
-    // ⭐️ FIX: Validate ID to prevent DrizzleQueryError (NaN issue)
     if (isNaN(id) || id === 0) {
         return c.json({ error: "Invalid transaction ID format." }, 400)
     }
 
-    // Perform a detailed join to get all linked data
     const result = await db.select({
       id: transactions.id,
       amount: transactions.amount,
@@ -100,12 +90,10 @@ transactionRouter.get('/:id', async (c) => {
       description: transactions.description,
       date: transactions.date,
       
-      // Linked IDs
       walletId: transactions.walletId,
       categoryId: transactions.categoryId,
       toWalletId: transactions.toWalletId,
 
-      // Joined Names/Data
       walletName: wallets.name,
       categoryName: categories.name,
     })
@@ -124,8 +112,6 @@ transactionRouter.get('/:id', async (c) => {
 
     return c.json(result)
 })
-
-// ---
 
 // 2. POST /transactions (Add new IDR transaction)
 transactionRouter.post('/', zValidator('json', transactionSchema), async (c) => {
@@ -170,6 +156,70 @@ transactionRouter.post('/', zValidator('json', transactionSchema), async (c) => 
 })
 
 
+// ⭐️ 3. PUT /transactions/:id (Edit existing IDR transaction) ⭐️
+transactionRouter.put('/:id', zValidator('json', transactionSchema), async (c) => {
+  const userId = getUserId(c)
+  const id = Number(c.req.param('id'))
+  const body = c.req.valid('json')
+
+  if (isNaN(id) || id === 0) {
+    return c.json({ error: "Invalid transaction ID format." }, 400)
+  }
+
+  // 1. Check if the target transaction exists and belongs to the user
+  const targetTransaction = await db.select()
+    .from(transactions)
+    .where(and(
+      eq(transactions.id, id),
+      eq(transactions.userId, userId)
+    ))
+    .limit(1)
+    .get();
+
+  if (!targetTransaction) {
+    return c.json({ error: "Transaction not found or unauthorized." }, 404);
+  }
+
+  // 2. Check if the new walletId exists and belongs to the user
+  const walletExists = await db.select().from(wallets).where(and(
+    eq(wallets.id, body.walletId),
+    eq(wallets.userId, userId)
+  )).limit(1);
+
+  if (walletExists.length === 0) {
+    return c.json({ error: "Wallet not found or unauthorized." }, 404);
+  }
+  
+  // 3. Check if the new categoryId exists and belongs to the user
+  const categoryExists = await db.select().from(categories).where(and(
+    eq(categories.id, body.categoryId),
+    eq(categories.userId, userId)
+  )).limit(1);
+  
+  if (categoryExists.length === 0) {
+    return c.json({ error: "Category not found or unauthorized." }, 404);
+  }
+
+  // --- UPDATE EXECUTION ---
+  const transactionDate = body.date ? new Date(body.date) : new Date();
+
+  const updated = await db.update(transactions)
+    .set({
+      amount: body.amount,
+      type: body.type,
+      categoryId: body.categoryId,
+      description: body.description,
+      walletId: body.walletId, 
+      toWalletId: body.toWalletId, 
+      date: transactionDate,
+    })
+    .where(eq(transactions.id, id))
+    .returning(); 
+
+  return c.json(updated[0], 200);
+})
+
+
 transactionRouter.delete('/:id', async (c) => {
   const userId = getUserId(c)
   const id = Number(c.req.param('id'))
@@ -182,14 +232,12 @@ transactionRouter.delete('/:id', async (c) => {
     .where(eq(transactions.id, id))
     .returning()
 
-  if (deleted.length === 0 || deleted[0].userId !== userId) {
+  if (deleted.length === 0 || deleted[0].userId !== userId) { 
     return c.json({ error: "Transaction not found or unauthorized" }, 404)
   }
 
   return c.json({ message: "Deleted successfully" })
 })
-
-
 
 
 export default transactionRouter
