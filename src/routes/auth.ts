@@ -10,7 +10,6 @@ import 'dotenv/config' // <--- 1. Load .env
 
 const authRouter = new Hono()
 
-// 2. Use the SAME secret as index.ts
 const JWT_SECRET = process.env.JWT_SECRET as string 
 
 if (!JWT_SECRET) {
@@ -35,7 +34,7 @@ authRouter.post('/register', zValidator('json', authSchema), async (c) => {
   }
 })
 
-// LOGIN
+
 authRouter.post('/login', zValidator('json', authSchema), async (c) => {
   const { username, password } = c.req.valid('json')
 

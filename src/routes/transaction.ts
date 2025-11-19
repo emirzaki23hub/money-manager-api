@@ -2,10 +2,9 @@ import { Hono } from 'hono'
 import { zValidator } from '@hono/zod-validator'
 import { z } from 'zod'
 import { db } from '../db'
-import { transactions } from '../db/schema'
-import { eq, desc } from 'drizzle-orm'
+import { transactions, wallets, categories } from '../db/schema' 
+import { eq, desc, and} from 'drizzle-orm'
 
-// Type definition for the JWT payload
 type Variables = {
   jwtPayload: {
     sub: number
@@ -17,26 +16,77 @@ const transactionRouter = new Hono<{ Variables: Variables }>()
 
 // Validation Schema for IDR
 const transactionSchema = z.object({
-  // IDR Rule: Must be a positive INTEGER (No decimals like 10500.50)
   amount: z.number().int().positive(), 
-  type: z.enum(['income', 'expense', 'transfer']), // Added transfer
-  category: z.string().min(1),
+  type: z.enum(['income', 'expense', 'transfer']),
+  categoryId: z.number().int(), // Requires the ID, not the string name
   description: z.string().optional(),
-  walletId: z.number().int(), // <--- REQUIRED NOW
-  toWalletId: z.number().int().optional(), // For transfers
-  date: z.string().optional(), // "2025-11-18" from frontend
+  walletId: z.number().int(), 
+  toWalletId: z.number().int().optional(),
+  date: z.string().optional(),
 })
 
-// 1. GET /transactions (List all my transactions)
 transactionRouter.get('/', async (c) => {
   const userId = c.get('jwtPayload').sub
 
-  const result = await db.select()
+  const result = await db.select({
+    id: transactions.id,
+    amount: transactions.amount,
+    type: transactions.type,
+    description: transactions.description,
+    date: transactions.date,
+    
+    // Joined data
+    walletName: wallets.name,
+    categoryName: categories.name,
+    
+    walletId: transactions.walletId,
+    categoryId: transactions.categoryId,
+  })
     .from(transactions)
     .where(eq(transactions.userId, userId))
-    .orderBy(desc(transactions.date)) // Changed from createdAt to date
+    .leftJoin(wallets, eq(transactions.walletId, wallets.id)) 
+    .leftJoin(categories, eq(transactions.categoryId, categories.id)) 
+    .orderBy(desc(transactions.date));
 
   return c.json(result)
+})
+
+// 1.1 GET /transactions/:id (Transaction Detail)
+transactionRouter.get('/:id', async (c) => {
+    const userId = c.get('jwtPayload').sub
+    const id = Number(c.req.param('id'))
+
+    // Perform a detailed join to get all linked data
+    const result = await db.select({
+      id: transactions.id,
+      amount: transactions.amount,
+      type: transactions.type,
+      description: transactions.description,
+      date: transactions.date,
+      
+      // Linked IDs
+      walletId: transactions.walletId,
+      categoryId: transactions.categoryId,
+      toWalletId: transactions.toWalletId,
+
+      // Joined Names/Data
+      walletName: wallets.name,
+      categoryName: categories.name,
+    })
+      .from(transactions)
+      .where(and(
+          eq(transactions.id, id),
+          eq(transactions.userId, userId) // Crucial: Only load if owned by user
+      ))
+      .leftJoin(wallets, eq(transactions.walletId, wallets.id)) 
+      .leftJoin(categories, eq(transactions.categoryId, categories.id)) 
+      .get() // Use .get() to return a single object
+
+    if (!result) {
+        return c.json({ error: "Transaction not found." }, 404)
+    }
+
+    return c.json(result)
 })
 
 // 2. POST /transactions (Add new IDR transaction)
@@ -44,16 +94,36 @@ transactionRouter.post('/', zValidator('json', transactionSchema), async (c) => 
   const userId = c.get('jwtPayload').sub
   const body = c.req.valid('json')
 
-  // Handle Date (If empty, use "now")
+  // --- WALLET CHECK ---
+  const walletExists = await db.select().from(wallets).where(and(
+    eq(wallets.id, body.walletId),
+    eq(wallets.userId, userId)
+  )).limit(1);
+
+  if (walletExists.length === 0) {
+    return c.json({ error: "Wallet not found or unauthorized." }, 404);
+  }
+  
+  // --- CATEGORY CHECK ---
+  const categoryExists = await db.select().from(categories).where(and(
+    eq(categories.id, body.categoryId),
+    eq(categories.userId, userId)
+  )).limit(1);
+  
+  if (categoryExists.length === 0) {
+    return c.json({ error: "Category not found or unauthorized." }, 404);
+  }
+
+  // Handle Date
   const transactionDate = body.date ? new Date(body.date) : new Date()
 
   const result = await db.insert(transactions).values({
     userId: userId,
     amount: body.amount,
     type: body.type,
-    category: body.category,
+    categoryId: body.categoryId, // Using categoryId
     description: body.description,
-    walletId: body.walletId, // <--- FIXED: Added this missing field
+    walletId: body.walletId, 
     toWalletId: body.toWalletId,
     date: transactionDate,
   }).returning()
@@ -67,13 +137,9 @@ transactionRouter.delete('/:id', async (c) => {
   const id = Number(c.req.param('id'))
 
   const deleted = await db.delete(transactions)
-    .where(
-      // Ensure user can only delete their OWN transaction
-      eq(transactions.id, id)
-    )
+    .where(eq(transactions.id, id))
     .returning()
 
-  // Check if the item existed and belonged to the user
   if (deleted.length === 0 || deleted[0].userId !== userId) {
     return c.json({ error: "Transaction not found or unauthorized" }, 404)
   }
